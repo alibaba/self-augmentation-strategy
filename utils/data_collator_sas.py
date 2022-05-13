@@ -9,8 +9,8 @@ from torch.utils.data.dataset import Dataset
 from transformers.models.auto.tokenization_auto import tokenizer_class_from_name
 from transformers.tokenization_utils_base import BatchEncoding
 from .sas_utils import SequenceSideInfo
-
-
+from .text_augmentation import randomly_switch_case_str
+from transformers import default_data_collator
 
 
 class SASValidationDataset(Dataset):
@@ -352,5 +352,50 @@ class DataCollatorForSasPretraining:
         return {"input_ids": inputs.long(), "mlm_labels": mlm_labels.long(), "rtd_labels": rtd_labels.long(), 
                 "side_info_sets": {"batch_idx": idx.long(), "dataset_sizes": self.dataset_sizes, "dynamic_masked_indices": dynamic_masked_indices, "dynamic_masked_labels": dynamic_masked_labels}}
 
+class DataCollatorForSwitchCaseAugmentation:
+    def __init__(self, switch_case_prob, tokenizer, padding, max_length) -> None:
+        self.switch_case_prob = switch_case_prob
+        self.tokenizer = tokenizer
+        self.padding = padding
+        self.max_length = max_length
+
+    def __call__(self, features):
+        total = len(features)
+        cased_examples_org = [features[i]['input_sent1'] for i in range(total)]
+        cased_examples = []
+        for idx in range(total):
+            tmp = features[idx]['input_sent1']
+            if np.random.rand(1) > 0.5:
+                tmp = randomly_switch_case_str(features[idx]['input_sent1'], switch_case_probability=self.switch_case_prob)
+            cased_examples.append(tmp)
+            
+        if 'input_sent2' in features[0].keys():
+            cased_examples_2_org = [features[i]['input_sent2'] for i in range(total)]
+            cased_examples_2 = []
+            for idx in range(total):
+                tmp = features[idx]['input_sent2']
+                if np.random.rand(1) > 0.5:
+                    tmp = randomly_switch_case_str(features[idx]['input_sent2'], switch_case_probability=self.switch_case_prob)
+                cased_examples_2.append(tmp)
+
+        args_org = (
+            (cased_examples_org,) if 'input_sent2' not in features[0].keys() else (cased_examples_org, cased_examples_2_org)
+        )
+        args = (
+            (cased_examples,) if 'input_sent2' not in features[0].keys() else (cased_examples, cased_examples_2)
+        )
+        result_org = self.tokenizer(*args_org, padding=self.padding, max_length=self.max_length, truncation=True)
+        result = self.tokenizer(*args, padding=self.padding, max_length=self.max_length, truncation=True)
+
+        final_result = [{} for i in range(len(result_org['input_ids']))]
+        for i in range(len(result['input_ids'])):
+            for key in result_org.keys():
+                final_result[i][key] = result_org[key][i]
+                final_result[i]['switch_' + key] = result[key][i]
+            if 'label' in features[i].keys():
+                final_result[i]['label'] = features[i]['label']
+
+        batch = default_data_collator(final_result)
+        return batch
 
         

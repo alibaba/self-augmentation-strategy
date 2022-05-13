@@ -1,3 +1,17 @@
+# coding=utf-8
+# Copyright 2020-present the Alibaba Group Holding Limited.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from torch.utils.data.dataloader import DataLoader
 from dataclasses import dataclass, field
 from torch.utils.data.sampler import RandomSampler, Sampler, SequentialSampler
@@ -5,8 +19,15 @@ import os
 import torch
 import math
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-from transformers import Trainer, TrainingArguments
+from .trainer import Trainer, TrainingArguments
+import torch.nn.functional as F
 
+def js_div(p, q):
+    m = (p + q) / 2
+    a = F.kl_div(p.log(), m, reduction='batchmean')
+    b = F.kl_div(q.log(), m, reduction='batchmean')
+    jsd = ((a + b) / 2)
+    return jsd
 @dataclass
 class SasTrainingArguments(TrainingArguments):
     # Support to set up warmup steps as a ratio

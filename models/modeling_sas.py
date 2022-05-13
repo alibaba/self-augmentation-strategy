@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2019 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright 2020-present the Alibaba Group Holding Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,7 @@ from functools import partial
 from utils.sas_utils import SequenceSideInfo
 from .trainer_callback_sas import SasTrainerCallback, SasWandbCallback, SasTensorBoardCallback
 import torch.nn.functional as F
+import copy
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "SasConfig"
@@ -837,7 +838,11 @@ class SasClassificationHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # configure the cls dropout rate
+        drop_out = getattr(config, "cls_dropout", None)
+        drop_out = config.hidden_dropout_prob if drop_out is None else drop_out
+        self.dropout = nn.Dropout(drop_out)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
     def forward(self, features, **kwargs):
@@ -848,6 +853,28 @@ class SasClassificationHead(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+
+class Similarity(nn.Module):
+    """
+    Dot product or cosine similarity
+    """
+    def __init__(self, temp):
+        super().__init__()
+        self.temp = temp
+        self.cos = nn.CosineSimilarity(dim=-1)
+    
+    def forward(self, x, y):
+        return self.cos(x, y) / self.temp
+
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def __call__(self, params_ema, params):
+        if params_ema is None:
+            return params
+        return params_ema * self.beta + (1 - self.beta) * params
 
 
 @add_start_docstrings(
@@ -868,12 +895,34 @@ class SasForSequenceClassification(SasPreTrainedModel):
         assert(0 <= self.mixup_ratio < 1)
 
         self.trainer_callback = SasTrainerCallback()
-        # self.wandb_callback = SasWandbCallback()
+        self.tensorboard_callback = SasTensorBoardCallback()
         self.global_step = None
         self.max_steps = None
 
+        if getattr(config, "contrast_temp", None):
+            self.sim = Similarity(temp=config.contrast_temp)
+
         self.init_weights()
 
+        momentum_encoder_beta = getattr(config, "momentum_encoder_beta", 0)
+        self.momentum_encoder_beta = momentum_encoder_beta
+
+        if self.momentum_encoder_beta > 0.0:
+            self.params_ema_updater = EMA(self.momentum_encoder_beta)
+            self.sas_ema = None
+            self.classifier_ema = None
+
+    def get_model_ema(self):
+        if self.sas_ema is None:
+            self.sas_ema = copy.deepcopy(self.sas)
+        else:
+            for params_ema, params in zip(self.sas_ema.parameters(), self.sas.parameters()):
+                params_ema.data = self.params_ema_updater(params_ema, params)
+        if self.classifier_ema is None:
+            self.classifier_ema = copy.deepcopy(self.classifier)
+        else:
+            for params_ema, params in zip(self.classifier_ema.parameters(), self.classifier.parameters()):
+                params_ema.data = self.params_ema_updater(params_ema, params)
 
     def batch_initial_status_update(self):
         if self.training:
@@ -910,6 +959,16 @@ class SasForSequenceClassification(SasPreTrainedModel):
         idx=None, 
         ss_sentence_position_in_sequence=None,
         ss_token_position_in_sentence=None,
+        # reversed sentence pair input ids, processed by process function in run_glue.py
+        reverse_input_ids=None,
+        reverse_token_type_ids=None,
+        reverse_attention_mask=None,
+        # For switch case 
+        input_sent1=None,
+        input_sent2=None,
+        switch_input_ids=None,
+        switch_token_type_ids=None,
+        switch_attention_mask=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -920,54 +979,450 @@ class SasForSequenceClassification(SasPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         mixup_ratio = self.batch_initial_status_update()
 
-        discriminator_hidden_states = self.sas(
-            input_ids,
-            attention_mask,
-            token_type_ids,
-            position_ids,
-            head_mask,
-            inputs_embeds,
-            output_attentions,
-            output_hidden_states,
-            side_info_sets,
-            return_dict,
-        )
+        self.config.rdrop_weight = getattr(self.config, "rdrop_weight", 0)
+        self.config.contrast_weight = getattr(self.config, "contrast_weight", 0)
+        self.config.switch_case_prob = getattr(self.config, "switch_case_prob", 0)
 
-        sequence_output = discriminator_hidden_states[0]
+        if self.config.rdrop_weight > 0 or self.config.contrast_weight > 0:
+            if self.config.switch_case_prob > 0.0:
+                input_ids = torch.cat([input_ids, switch_input_ids], dim=0)
+                attention_mask = torch.cat([attention_mask, switch_attention_mask], dim=0)
+                token_type_ids = torch.cat([token_type_ids, switch_token_type_ids], dim=0)
+                if labels is not None:
+                    labels = torch.cat([labels, labels], dim=0)
+                loss, logits, outputs = self.sas_kl_within_batch(input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict)
+            
+            elif self.momentum_encoder_beta > 0.0:
+                loss, logits, outputs = self.sas_momentum_kl(input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict)
+            
+            else:
+                loss, logits, outputs = self.sas_kl(input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict)
+        
 
-        logits = self.classifier(sequence_output)
-        loss = None
-        if labels is not None:
-            if not self.training or mixup_ratio == 0 or self.num_labels == 1:
-                if self.num_labels == 1:
-                    #  We are doing regression
-                    loss_fct = MSELoss()
-                    loss = loss_fct(logits.view(-1), labels.view(-1))
-                else:
-                    loss_fct = CrossEntropyLoss()
-                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            else:  # Do mixup
-                batch_size = sequence_output.shape[0]
-                mixup_idx = np.roll(np.arange(batch_size), shift=-1)
-                sequence_output_mixup = (1 - mixup_ratio) * sequence_output + mixup_ratio * sequence_output[mixup_idx, ...]
-                logits_mixup = self.classifier(sequence_output_mixup)
+        elif self.config.switch_case_prob > 0.0:
+            if self.training:
+                input_ids = switch_input_ids
+                attention_mask = switch_attention_mask
+                token_type_ids = switch_token_type_ids
+            loss, logits, outputs = self.sas_cross_entropy(input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict)
+        
+        elif reverse_input_ids is not None:
+            loss, logits, outputs = self.sas_cross_entropy_with_reverse_input(input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict)
+        
+        else:
+            discriminator_hidden_states = self.sas(
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                position_ids,
+                head_mask,
+                inputs_embeds,
+                output_attentions,
+                output_hidden_states,
+                side_info_sets,
+                return_dict,
+            )
 
-                one_hot = torch.zeros_like(logits_mixup).scatter_(-1, labels.view(-1,1), 1)
-                labels_mixup = (1 - mixup_ratio) * one_hot + mixup_ratio * one_hot[mixup_idx, ...]
+            sequence_output = discriminator_hidden_states[0]
 
-                log_prb = F.log_softmax(logits_mixup, dim=1)
-                loss = -(labels_mixup * log_prb).sum(dim=1).mean()
+            logits = self.classifier(sequence_output)
+            loss = None
+            if labels is not None:
+                if not self.training or mixup_ratio == 0 or self.num_labels == 1:
+                    if self.num_labels == 1:
+                        #  We are doing regression
+                        loss_fct = MSELoss()
+                        loss = loss_fct(logits.view(-1), labels.view(-1))
+                    else:
+                        loss_fct = CrossEntropyLoss()
+                        loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                else:  # Do mixup
+                    batch_size = sequence_output.shape[0]
+                    mixup_idx = np.roll(np.arange(batch_size), shift=-1)
+                    sequence_output_mixup = (1 - mixup_ratio) * sequence_output + mixup_ratio * sequence_output[mixup_idx, ...]
+                    logits_mixup = self.classifier(sequence_output_mixup)
+
+                    one_hot = torch.zeros_like(logits_mixup).scatter_(-1, labels.view(-1,1), 1)
+                    labels_mixup = (1 - mixup_ratio) * one_hot + mixup_ratio * one_hot[mixup_idx, ...]
+
+                    log_prb = F.log_softmax(logits_mixup, dim=1)
+                    loss = -(labels_mixup * log_prb).sum(dim=1).mean()
 
         if not return_dict:
-            output = (logits,) + discriminator_hidden_states[1:]
+            output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
         return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
-            hidden_states=discriminator_hidden_states.hidden_states,
-            attentions=discriminator_hidden_states.attentions,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
         )
+
+    def sas_cross_entropy_with_reverse_input(self, input_ids, attention_mask,token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict,reverse_input_ids,reverse_token_type_ids,reverse_attention_mask):
+        prediction_scores_list = []
+        outputs_list = []
+        for i in range(2):
+            if i == 1:
+                outputs = self.sas(
+                    reverse_input_ids,
+                    token_type_ids=reverse_token_type_ids,
+                    attention_mask=reverse_attention_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict
+                )
+            else:
+                outputs = self.sas(
+                    input_ids,
+                    token_type_ids=token_type_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict
+                )
+            
+            sequence_output = outputs[0]
+            logits = self.classifier(sequence_output)
+            prediction_scores_list.append(logits)
+            outputs_list.append(outputs)
+
+        loss = None
+        for logits in prediction_scores_list:
+            if labels is not None:
+                if self.num_labels == 1:
+                    loss_fn = torch.nn.MSELoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1), labels.view(-1))
+                else:
+                    loss_fn = CrossEntropyLoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        if loss is not None:
+            if self.num_labels == 1:
+                loss_fn = MSELoss()
+                rdrop_loss = self.config.reverse_weight * loss_fn(prediction_scores_list[0].view(-1), prediction_scores_list[-1].view(-1))
+                loss += rdrop_loss
+            else:
+                # use kl divergence loss
+                p = torch.log_softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                p_tec = torch.softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                q = torch.log_softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+                q_tec = torch.softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+
+                kl_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none').sum()
+                reverse_kl_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none').sum()
+
+                rdrop_loss = self.config.reverse_weight * (kl_loss + reverse_kl_loss) / 2.0
+                loss += rdrop_loss
+        
+        return loss, prediction_scores_list[0], outputs_list[0]
+
+    
+    def sas_cross_entropy(self, input_ids, attention_mask,token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict):
+        outputs = self.sas(
+            input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        sequence_output = outputs[0]
+        logits = self.classifier(sequence_output)
+
+        loss = None
+        if labels is not None:
+            if self.num_labels == 1:
+                loss_fn = torch.nn.MSELoss()
+                loss = loss_fn(logits.view(-1), labels.view(-1))
+            else:
+                loss_fn = CrossEntropyLoss()
+                loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+        return loss, logits, outputs
+
+
+    def sas_kl_within_batch(self, input_ids, attention_mask, token_type_ids,
+    position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, return_dict):
+        batch_size = input_ids.size(0)
+        outputs = self.sas(
+            input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        sequence_output = outputs[0]
+        logits = self.classifier(sequence_output)
+        
+        loss = None
+        if labels is not None:
+            if self.num_labels == 1:
+                loss_fn = torch.nn.MSELoss()
+                loss = loss_fn(logits.view(-1), labels.view(-1))
+            else:
+                loss_fn = CrossEntropyLoss()
+                loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+            loss = 2 * loss  # to match the scale in rdrop
+
+        logits_0, logits_1 = logits[: batch_size // 2], logits[batch_size // 2 :]
+        if loss is not None:
+            if self.num_labels == 1:
+                loss_fn = MSELoss()
+                rdrop_loss = self.config.rdrop_weight * loss_fn(logits_0.view(-1), logits_1.view(-1))
+                loss += rdrop_loss
+            else:
+                # use kl divergence loss
+                p = torch.log_softmax(logits_0.view(-1, self.num_labels), dim=-1)
+                p_tec = torch.softmax(logits_0.view(-1, self.num_labels), dim=-1)
+                q = torch.log_softmax(logits_1.view(-1, self.num_labels), dim=-1)
+                q_tec = torch.softmax(logits_1.view(-1, self.num_labels), dim=-1)
+
+                kl_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none').sum()
+                reverse_kl_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none').sum()
+
+                rdrop_loss = self.config.rdrop_weight * (kl_loss + reverse_kl_loss) / 2.0
+                loss += rdrop_loss                       
+
+        # outputs may cause size mis-match
+        return loss, logits_0, outputs
+
+    def sas_kl(self, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions, output_hidden_states, 
+        return_dict):
+        prediction_scores_list = []
+        outputs_list = []
+        cls_representation_embeddings_list = []
+        for i in range(2):
+            outputs = self.sas(
+                    input_ids,
+                    token_type_ids=token_type_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict
+                )
+            sequence_output = outputs[0]
+            if self.config.contrast_weight > 0.0:
+                cls_representation_embeddings_list.append(sequence_output[:, 0, :])
+            
+            if self.config.rdrop_weight > 0.0 or (self.config.rdrop_weight == 0 and i == 0):
+                logits = self.classifier(sequence_output)
+                prediction_scores_list.append(logits)
+                outputs_list.append(outputs)
+        
+        loss = None
+        for logits in prediction_scores_list:
+            if labels is not None:
+                if self.num_labels == 1:
+                    loss_fn = torch.nn.MSELoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1), labels.view(-1))
+                else:
+                    loss_fn = CrossEntropyLoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        if loss is not None:
+            cls_loss = loss.item()
+        if loss is not None and self.config.rdrop_weight > 0:
+            if self.num_labels == 1:
+                loss_fn = MSELoss()
+                rdrop_loss = self.config.rdrop_weight * loss_fn(prediction_scores_list[0].view(-1), prediction_scores_list[-1].view(-1))
+                loss += rdrop_loss
+            
+            else:
+                # use kl divergence loss
+                p = torch.log_softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                p_tec = torch.softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                q = torch.log_softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+                q_tec = torch.softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+
+                if self.config.filter_outliers:
+                    kl_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none').sum(1)
+                    reverse_kl_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none').sum(1)
+
+                    if torch.distributed.is_initialized() and self.training:
+                        kl_loss_list = [torch.zeros_like(kl_loss) for _ in range(torch.distributed.get_world_size())]
+                        reverse_kl_loss_list = [torch.zeros_like(reverse_kl_loss) for _ in range(torch.distributed.get_world_size())]
+                        torch.distributed.all_gather(tensor_list=kl_loss_list,tensor=kl_loss.contiguous())
+                        torch.distributed.all_gather(tensor_list=reverse_kl_loss_list,tensor=reverse_kl_loss.contiguous())
+                        kl_loss_list[torch.distributed.get_rank()] = kl_loss
+                        reverse_kl_loss_list[torch.distributed.get_rank()] = reverse_kl_loss
+
+                        kl_loss = torch.cat(kl_loss_list, 0)
+                        reverse_kl_loss = torch.cat(reverse_kl_loss_list, 0)
+                    
+                    # filter outliers
+                    kl_range = np.quantile(kl_loss.detach().cpu().numpy(), [0.25, 0.75])
+                    rv_kl_range = np.quantile(reverse_kl_loss.detach().cpu().numpy(), [0.25, 0.75])
+
+                    kl_loss = torch.where(kl_loss > kl_range[0]-1.5*(kl_range[1]-kl_range[0]), kl_loss, torch.tensor([0.0], device=loss.device))
+                    false_positive_count = (kl_loss == 0).sum().item()
+                    kl_loss = kl_loss.sum()
+
+                    reverse_kl_loss = torch.where(reverse_kl_loss > rv_kl_range[0] - 1.5*(rv_kl_range[1]-rv_kl_range[0]), reverse_kl_loss, torch.tensor([0.0], device=loss.device))
+                    false_positive_count_reverse = (reverse_kl_loss == 0).sum().item()
+                    reverse_kl_loss = reverse_kl_loss.sum()
+                    
+                else:
+                    kl_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none').sum()
+                    reverse_kl_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none').sum()
+
+                rdrop_loss = self.config.rdrop_weight * (kl_loss + reverse_kl_loss) / 2.0
+                loss += rdrop_loss
+        
+        if loss is not None and self.config.contrast_weight > 0:
+            z1, z2 = cls_representation_embeddings_list[0],cls_representation_embeddings_list[1]
+            if self.config.sub_dim is not None:
+                z1, z2 = z1[:, :self.config.sub_dim], z2[:, :self.config.sub_dim]
+            if torch.distributed.is_initialized() and self.training:
+                z1_list = [torch.zeros_like(z1) for _ in range(torch.distributed.get_world_size())]
+                z2_list = [torch.zeros_like(z2) for _ in range(torch.distributed.get_world_size())]
+                torch.distributed.all_gather(tensor_list=z1_list,tensor=z1.contiguous())
+                torch.distributed.all_gather(tensor_list=z2_list,tensor=z2.contiguous())
+
+                z1_list[torch.distributed.get_rank()] = z1
+                z2_list[torch.distributed.get_rank()] = z2
+
+                z1 = torch.cat(z1_list, 0)
+                z2 = torch.cat(z2_list, 0)
+
+            cos_sim = self.sim(z1.unsqueeze(1), z2.unsqueeze(0))
+
+            labels = torch.arange(cos_sim.size(0)).long().to(self.device)
+
+            contrast_loss = self.config.contrast_weight * nn.CrossEntropyLoss()(cos_sim, labels)
+
+            loss += contrast_loss
+        
+        if self.training:
+            global_step = self.trainer_callback.state.global_step
+            if global_step % 5 == 0:
+                print("\r step %d: total loss %.5f classification loss %.5f kl loss %.5f contrast loss %.5f" % (
+                    global_step,
+                    loss.item(),
+                    cls_loss,
+                    rdrop_loss.item() if self.config.rdrop_weight > 0 else 0,
+                    contrast_loss.item() if self.config.contrast_weight > 0 else 0
+                ))
+                self.inform['global_step'] = global_step
+                self.inform['total_loss'] = loss.item()
+                self.inform['classfication_loss'] = cls_loss
+                self.inform['rdrop_loss'] = rdrop_loss.item() if self.config.rdrop_weight > 0 else 0
+                self.inform['contrast_loss'] = contrast_loss.item() if self.config.contrast_weight > 0 else 0
+                self.inform['false_positive_count'] = false_positive_count if self.config.filter_outliers > 0 else 0
+                self.inform['false_positive_count_reverse'] = false_positive_count_reverse if self.config.filter_outliers > 0 else 0
+                self.tensorboard_callback.log = self.inform
+        return loss, prediction_scores_list[0], outputs_list[0]
+        
+
+    def sas_momentum_kl(self, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds, labels, output_attentions,output_hidden_states,
+        return_dict):
+        prediction_scores_list = []
+        outputs_list = []
+        outputs = self.sas(
+                input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict
+            )
+        sequence_output = outputs[0]
+        logits = self.classifier(sequence_output)
+        
+        prediction_scores_list.append(logits)
+        outputs_list.append(outputs)
+
+        with torch.no_grad():
+            self.get_model_ema()
+            outputs = self.sas_ema(
+                input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict
+            )
+            sequence_output = outputs[0]
+            logits = self.classifier_ema(sequence_output)
+            prediction_scores_list.append(logits)
+            outputs_list.append(outputs)
+        
+        loss = None
+        for logits in prediction_scores_list:
+            if labels is not None:
+                if self.num_labels == 1:
+                    loss_fn = torch.nn.MSELoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1), labels.view(-1))
+                else:
+                    loss_fn = CrossEntropyLoss()
+                    if loss:
+                        loss += loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+                    else:
+                        loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+        
+        if loss is not None:
+            cls_loss = loss.item()
+        if loss is not None and self.config.rdrop_weight > 0:
+            if self.num_labels == 1:
+                loss_fn = MSELoss()
+                rdrop_loss = self.config.rdrop_weight * loss_fn(prediction_scores_list[0].view(-1), prediction_scores_list[-1].view(-1))
+                loss += rdrop_loss
+            
+            else:
+                # use kl divergence loss
+                p = torch.log_softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                p_tec = torch.softmax(prediction_scores_list[0].view(-1, self.num_labels), dim=-1)
+                q = torch.log_softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+                q_tec = torch.softmax(prediction_scores_list[-1].view(-1, self.num_labels), dim=-1)
+
+                kl_loss = torch.nn.functional.kl_div(p, q_tec, reduction='none').sum()
+                reverse_kl_loss = torch.nn.functional.kl_div(q, p_tec, reduction='none').sum()
+
+                rdrop_loss = self.config.rdrop_weight * (kl_loss + reverse_kl_loss) / 2.0
+                loss += rdrop_loss
+        
+        if self.training:
+            global_step = self.trainer_callback.state.global_step
+            if global_step % 10 == 0:
+                print("\r step %d: total loss %.5f classification loss %.5f kl loss %.5f" % (
+                    global_step,
+                    loss.item(),
+                    cls_loss,
+                    rdrop_loss.item() if self.config.rdrop_weight > 0 else 0,
+                ))
+        return loss, prediction_scores_list[0], outputs_list[0]
+
+
+
 
 
 @add_start_docstrings(

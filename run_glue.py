@@ -23,22 +23,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
 from datasets import load_dataset, load_metric
-import time
 import shutil
 
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
-    AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
     PretrainedConfig,
-    # Trainer,              # to be repalced by SAS-specific one. See below.
-    # TrainingArguments,    # to be repalced by SAS-specific one. See below
     default_data_collator,
     set_seed,
 )
+
+from utils.data_collator_sas import 
 from models.tokenization_sas import SasTokenizer
 from transformers.trainer_utils import is_main_process, EvaluationStrategy
 

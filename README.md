@@ -63,10 +63,8 @@ Only the SAS without the disentangled attention mechanism is released for now. T
     bash finetune.sh MNLI 0 sas-small output_dir 1e-4 32 4 42
 ```
 
-### Pre-trained models
+### GLUE Scores(Dev)
 
-|  Model   | Description | Download
-|  ----  | ----  | ---- |
-| SAS_small  | SAS using the architecture the same as Electra-small model's discriminator | [SAS_small](https://dirl-sas-open.oss-cn-hangzhou.aliyuncs.com/SAS_small.zip)
-| SAS_DA_small  | SAS_small with disentangled attention | [SAS_DA_small](https://dirl-sas-open.oss-cn-hangzhou.aliyuncs.com/SAS_DA_small.zip)
-| SAS_DA_base | SAS using the architecture the same as Electra-base model's discriminator and disentangled attention | [SAS_DA_base](https://dirl-sas-open.oss-cn-hangzhou.aliyuncs.com/SAS_DA_base.zip)
+| Model | MNLI | QQP | QNLI | SST2 | CoLA | STSB | MRPC | RTE |
+| :-----| :-----| ----: | :----: | :----: | :----: | :----: | :----: | :----: |
+| SAS_small | 81.82 | 90.14 | 89.21 | 90.13 | 61.33 | 87.55 | 87.25 | 66.06 |
